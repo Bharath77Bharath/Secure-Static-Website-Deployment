@@ -20,8 +20,9 @@ phases:
 
   post_build:
     commands:
-      - echo "Validation successful. Deploing website to S3..."
-      - 'aws s3 sync Frontend/ s3://secure-static-website-b1/Frontend/'
-      - echo "Website deployed successfully to S3 bucket."
-      - 'aws cloudfront create-invalidation --distribution-id E60LMWR8OLTZ2 --paths "/*"'
-      - echo "CloudFront cache invalidation request sent."
+      - echo "Validation successful. Proceeding to deployment..."
+  
+  artifacts:
+    base-directory: Frontend
+    files:
+      - '**/*'
