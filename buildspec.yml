@@ -22,7 +22,7 @@ phases:
     commands:
       - echo "Validation successful. Proceeding to deployment..."
   
-  artifacts:
-    base-directory: Frontend
-    files:
-      - '**/*'
+artifacts:
+  base-directory: Frontend
+  files:
+    - '**/*'
