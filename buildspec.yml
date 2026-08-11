@@ -20,4 +20,6 @@ phases:
 
   post_build:
     commands:
-      - echo "Website validation completed successfully!"
+      - echo "Validation successful. Deploing website to S3..."
+      - aws s3 sync Frontend/ s3://secure-static-website-b1
+      - echo "Website deployed successfully to S3 bucket: secure-static-website-b1"
