@@ -4,20 +4,20 @@ phases:
 
   install:
     commands:
-      - 'echo "Starting the build environment...'
+      - echo Starting the build environment
   
   pre_build:
     commands:
-      - 'echo "Starting website validation..."'
+      - echo Starting website validation
 
   build:
     commands:
-      - 'echo "Checking frontend files..."'
-      - 'test -f Frontend/index.html || { echo "Error: index.html not found!"; exit 1; }'
-      - 'test -f Frontend/style.css || { echo "Error: style.css not found!"; exit 1; }'
-      - 'test -f Frontend/script.js || { echo "Error: script.js not found !"; exit 1; }'
-      - 'echo "All frontend files are present. Proceeding with deployment..."'
+      - echo Checking frontend files
+      - test -f Frontend/index.html
+      - test -f Frontend/style.css
+      - test -f Frontend/script.js
+      - echo All frontend files are present Proceeding with deployment
 
   post_build:
     commands:
-      - 'echo "Website validation completed successfully. Deployment can proceed."'
+      - echo Website validation completed successfully Deployment can proceed
