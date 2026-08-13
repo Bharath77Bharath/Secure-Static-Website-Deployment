@@ -509,22 +509,21 @@ Resources:
                 Effect: Allow
                 Action:
                   - logs:CreateLogGroup
-                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codepipeline/${ProjectName}-Pipeline
-
+                Resource: '*'
               # Allow the Commands action to create log streams
               # inside the CodePipeline log group.
               - Sid: CreateCodePipelineLogStream
                 Effect: Allow
                 Action:
                   - logs:CreateLogStream
-                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codepipeline/${ProjectName}-Pipeline:*
+                Resource: '*'
 
               # Allow the Commands action to write execution logs.
               - Sid: WriteCodePipelineLogEvents
                 Effect: Allow
                 Action:
                   - logs:PutLogEvents
-                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codepipeline/${ProjectName}-Pipeline:*
+                Resource: '*'
       # Standard project tags.
       Tags:
         - Key: Owner
