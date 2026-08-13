@@ -48,6 +48,19 @@ Parameters:
     Type: String
     Default: main
     Description: GitHub branch used as the pipeline source
+    # ----------------------------------------------------------
+  # Notification email address
+  #
+  # SNS sends approval, rejection and deployment-success
+  # notifications to this email address.
+  #
+  # The subscription must be confirmed from the email
+  # received from Amazon SNS.
+  # ----------------------------------------------------------
+  NotificationEmail:
+    Type: String
+    Default: bharath.lenin.dev@gmail.com
+    Description: Email address used for deployment notifications
 
 
 # ------------------------------------------------------------
@@ -113,6 +126,27 @@ Resources:
             Condition:
               StringLike:
                 AWS:SourceArn: !Sub arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/*
+          # ----------------------------------------------------------
+          # Allow Amazon SNS to use this customer-managed KMS key.
+          #
+          # The SNS topic will use this key for server-side
+          # encryption of notification messages.
+          # ----------------------------------------------------------
+          - Sid: AllowSNSToUseKMSKey
+            Effect: Allow
+
+            Principal:
+              Service: sns.amazonaws.com
+
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+
+            Resource: '*'
+
+            Condition:
+              StringEquals:
+                kms:ViaService: !Sub sns.${AWS::Region}.amazonaws.com
 
       # Standard project tags applied to the KMS key.
       Tags:
@@ -971,7 +1005,494 @@ Resources:
 
         - Key: Environment
           Value: !Ref Environment
+  # ------------------------------------------------------------
+  # SNS - Deployment Notification Topic
+  #
+  # A single SNS topic is used for:
+  # - Deployment approval notifications
+  # - Deployment rejection notifications
+  # - Successful deployment notifications
+  #
+  # Messages are encrypted at rest using the customer-managed
+  # KMS key created earlier in this stack.
+  # ------------------------------------------------------------
+  DeploymentNotificationTopic:
+    Type: AWS::SNS::Topic
 
+    Properties:
+
+      # Keep one topic for all deployment-related notifications.
+      TopicName: !Sub ${ProjectName}-DeploymentStatus
+
+      # Encrypt SNS messages using the project CMK.
+      KmsMasterKeyId: !Ref DeploymentKMSKey
+
+      # Apply the standard project tags.
+      Tags:
+        - Key: Owner
+          Value: !Ref Owner
+
+        - Key: DevelopedBy
+          Value: !Ref DevelopedBy
+
+        - Key: Project
+          Value: !Ref ProjectName
+
+        - Key: Environment
+          Value: !Ref Environment
+  # ------------------------------------------------------------
+  # SNS - Email Subscription
+  #
+  # SNS sends a confirmation email to the configured address.
+  # The recipient must confirm the subscription before emails
+  # can be delivered.
+  # ------------------------------------------------------------
+  DeploymentNotificationSubscription:
+    Type: AWS::SNS::Subscription
+
+    Properties:
+      TopicArn: !Ref DeploymentNotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+  # ----------------------------------------------------------
+  # IAM - Lambda Notification Role
+  #
+  # Allows the notification Lambda to:
+  # 1. Publish messages to SNS.
+  # 2. Read CodePipeline execution information.
+  # 3. Write execution logs to CloudWatch Logs.
+  # ----------------------------------------------------------
+  NotificationLambdaRole:
+    Type: AWS::IAM::Role
+
+    Properties:
+
+      # Allow AWS Lambda to assume this role.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+
+        Statement:
+          - Sid: LambdaAssumeRole
+            Effect: Allow
+
+            Principal:
+              Service: lambda.amazonaws.com
+
+            Action:
+              - sts:AssumeRole
+
+      Policies:
+
+        # ------------------------------------------------------
+        # Lambda logging permissions
+        # ------------------------------------------------------
+        - PolicyName: NotificationLambdaLoggingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+
+            Statement:
+              - Sid: CreateLogGroup
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                Resource: '*'
+
+              - Sid: CreateLogStream
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                Resource: '*'
+
+              - Sid: WriteLogEvents
+                Effect: Allow
+                Action:
+                  - logs:PutLogEvents
+                Resource: '*'
+
+        # ------------------------------------------------------
+        # SNS publishing permissions
+        # ------------------------------------------------------
+        - PolicyName: NotificationLambdaSNSPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+
+            Statement:
+              - Sid: PublishDeploymentNotification
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref DeploymentNotificationTopic
+
+        # ------------------------------------------------------
+        # CodePipeline read permissions
+        #
+        # Lambda uses these APIs to retrieve execution and
+        # action information for the notification email.
+        # ------------------------------------------------------
+        - PolicyName: NotificationLambdaCodePipelineReadPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+
+            Statement:
+              - Sid: ReadPipelineExecution
+                Effect: Allow
+                Action:
+                  - codepipeline:GetPipelineExecution
+                  - codepipeline:ListActionExecutions
+                  - codepipeline:GetPipelineState
+                Resource: '*'
+
+      Tags:
+        - Key: Owner
+          Value: !Ref Owner
+
+        - Key: DevelopedBy
+          Value: !Ref DevelopedBy
+
+        - Key: Project
+          Value: !Ref ProjectName
+
+        - Key: Environment
+          Value: !Ref Environment
+  # ----------------------------------------------------------
+  # EventBridge - Manual Approval Status Rule
+  #
+  # Captures CodePipeline manual approval events and sends
+  # APPROVED / DENIED events to the notification Lambda.
+  # ----------------------------------------------------------
+  DeploymentApprovalEventRule:
+    Type: AWS::Events::Rule
+
+    Properties:
+      Name: !Sub ${ProjectName}-ApprovalStatus
+
+      Description: Captures CodePipeline manual approval status changes
+
+      State: ENABLED
+
+      EventPattern:
+        source:
+          - aws.codepipeline
+
+        detail-type:
+          - CodePipeline Action Execution State Change
+
+        detail:
+          pipeline:
+            - !Ref WebsitePipeline
+
+          stage:
+            - Approval
+
+          action:
+            - ApproveDeployment
+
+          state:
+            - SUCCEEDED
+            - FAILED
+
+      Targets:
+        - Id: DeploymentNotificationLambdaTarget
+          Arn: !GetAtt DeploymentNotificationLambda.Arn
+
+  # ----------------------------------------------------------
+  # Lambda Permission - EventBridge
+  #
+  # Allows the manual approval EventBridge rule to invoke
+  # the deployment notification Lambda.
+  # ----------------------------------------------------------
+  DeploymentApprovalEventLambdaPermission:
+    Type: AWS::Lambda::Permission
+
+    Properties:
+      FunctionName: !Ref DeploymentNotificationLambda
+
+      Action: lambda:InvokeFunction
+
+      Principal: events.amazonaws.com
+
+      SourceArn: !GetAtt DeploymentApprovalEventRule.Arn
+  # ----------------------------------------------------------
+  # Lambda - Deployment Notification Handler
+  #
+  # Receives EventBridge CodePipeline events and sends
+  # deployment status notifications through SNS.
+  # ----------------------------------------------------------
+  DeploymentNotificationLambda:
+    Type: AWS::Lambda::Function
+
+    Properties:
+
+      FunctionName: !Sub ${ProjectName}-Notification
+
+      Description: Sends CodePipeline deployment status notifications
+
+      Runtime: python3.12
+
+      Handler: index.lambda_handler
+
+      Timeout: 30
+
+      MemorySize: 128
+
+      Role: !GetAtt NotificationLambdaRole.Arn
+
+      Environment:
+        Variables:
+
+          # SNS topic receiving deployment notifications.
+          SNS_TOPIC_ARN: !Ref DeploymentNotificationTopic
+
+          # CodePipeline monitored by the notification Lambda.
+          PIPELINE_NAME: !Ref WebsitePipeline
+
+          # CloudFront URL included in successful deployment emails.
+          CLOUDFRONT_URL: !GetAtt WebsiteCloudFrontDistribution.DomainName
+
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+          from datetime import datetime, timezone
+
+          # AWS clients used by the notification Lambda.
+          sns = boto3.client("sns")
+          codepipeline = boto3.client("codepipeline")
+
+          # Environment variables configured by CloudFormation.
+          SNS_TOPIC_ARN = os.environ["SNS_TOPIC_ARN"]
+          PIPELINE_NAME = os.environ["PIPELINE_NAME"]
+          CLOUDFRONT_URL = os.environ["CLOUDFRONT_URL"]
+
+
+          def lambda_handler(event, context):
+
+              # Log the complete EventBridge event for troubleshooting
+              # and to verify the actual CodePipeline event structure.
+              print("Received EventBridge event:")
+              print(json.dumps(event, indent=2))
+
+              detail = event.get("detail", {})
+
+              # --------------------------------------------------
+              # Common pipeline information
+              # --------------------------------------------------
+              pipeline_name = detail.get(
+                  "pipeline",
+                  PIPELINE_NAME
+              )
+
+              execution_id = detail.get(
+                  "execution-id",
+                  "N/A"
+              )
+
+              region = event.get(
+                  "region",
+                  os.environ.get("AWS_REGION", "N/A")
+              )
+
+              event_time = event.get(
+                  "time",
+                  datetime.now(timezone.utc).isoformat()
+              )
+
+              state = detail.get(
+                  "state",
+                  "UNKNOWN"
+              )
+
+              # --------------------------------------------------
+              # Approval information
+              #
+              # These fields are extracted from the EventBridge
+              # event when they are available.
+              # --------------------------------------------------
+              stage = detail.get(
+                  "stage",
+                  "Manual-Approval"
+              )
+
+              action = detail.get(
+                  "action",
+                  "Approve-Deployment"
+              )
+
+              approved_by = detail.get(
+                  "approval-user",
+                  detail.get(
+                      "userIdentity",
+                      "N/A"
+                  )
+              )
+
+              approval_comment = detail.get(
+                  "approval-comment",
+                  detail.get(
+                      "comment",
+                      "N/A"
+                  )
+              )
+
+              # --------------------------------------------------
+              # APPROVED notification
+              # --------------------------------------------------
+              if state == "APPROVED":
+
+                  subject = "Deployment Approved"
+
+                  message = f"""Deployment Approved
+
+          Secure Static Website Deployment
+
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+          Pipeline:
+          {pipeline_name}
+
+          Stage:
+          {stage}
+
+          Action:
+          {action}
+
+          Region:
+          {region}
+
+          Status:
+          APPROVED
+
+          The production deployment has been approved successfully.
+
+          The pipeline will now continue with deployment.
+
+          Approved By:
+          {approved_by}
+
+          Approval Comment:
+          {approval_comment}
+
+          Execution ID:
+          {execution_id}
+
+          Event Time:
+          {event_time}
+          """
+
+              # --------------------------------------------------
+              # DENIED / REJECTED notification
+              # --------------------------------------------------
+              elif state in ["DENIED", "REJECTED"]:
+
+                  subject = "Deployment Rejected"
+
+                  message = f"""Deployment Rejected
+
+          Secure Static Website Deployment
+
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+          Pipeline:
+          {pipeline_name}
+
+          Stage:
+          {stage}
+
+          Action:
+          {action}
+
+          Region:
+          {region}
+
+          Status:
+          DENIED
+
+          The production deployment approval was rejected.
+
+          The pipeline will not continue with deployment.
+
+          Rejected By:
+          {approved_by}
+
+          Rejection Comment:
+          {approval_comment}
+
+          Execution ID:
+          {execution_id}
+
+          Event Time:
+          {event_time}
+          """
+
+              # --------------------------------------------------
+              # SUCCESSFUL deployment notification
+              # --------------------------------------------------
+              elif state == "SUCCEEDED":
+
+                  subject = "Deployment Successful"
+
+                  message = f"""Deployment Successful
+
+          Secure Static Website Deployment
+
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+          Pipeline:
+          {pipeline_name}
+
+          Region:
+          {region}
+
+          Status:
+          SUCCEEDED
+
+          The production deployment completed successfully.
+
+          Website:
+          {CLOUDFRONT_URL}
+
+          Execution ID:
+          {execution_id}
+
+          Event Time:
+          {event_time}
+          """
+
+              # --------------------------------------------------
+              # Ignore unsupported events.
+              # --------------------------------------------------
+              else:
+
+                  print(
+                      f"Ignoring unsupported pipeline state: {state}"
+                  )
+
+                  return {
+                      "statusCode": 200,
+                      "body": json.dumps("Event ignored")
+                  }
+
+              # --------------------------------------------------
+              # Publish the formatted notification through SNS.
+              # --------------------------------------------------
+              response = sns.publish(
+                  TopicArn=SNS_TOPIC_ARN,
+                  Subject=subject,
+                  Message=message
+              )
+
+              print(
+                  "SNS notification published:",
+                  response.get("MessageId")
+              )
+
+              return {
+                  "statusCode": 200,
+                  "body": json.dumps(
+                      "Notification published successfully"
+                  )
+              }
 # ------------------------------------------------------------
 # Outputs
 # Useful values exposed by the CloudFormation stack.
@@ -1033,3 +1554,12 @@ Outputs:
   WebsitePipelineName:
     Description: Name of the CodePipeline deployment pipeline
     Value: !Ref WebsitePipeline
+  
+  # SNS topic used by Lambda for deployment notifications.
+  DeploymentNotificationTopicArn:
+    Description: ARN of the SNS deployment notification topic
+    Value: !Ref DeploymentNotificationTopic
+
+  DeploymentNotificationLambdaArn:
+    Description: ARN of the deployment notification Lambda
+    Value: !GetAtt DeploymentNotificationLambda.Arn
