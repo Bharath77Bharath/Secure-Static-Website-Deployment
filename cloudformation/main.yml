@@ -1,0 +1,1001 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: Secure Static Website Deployment
+
+# ------------------------------------------------------------
+# Parameters
+# Centralized values used throughout the CloudFormation stack.
+# ------------------------------------------------------------
+Parameters:
+
+  ProjectName:
+    Type: String
+    Default: SecureStaticWebsiteDeployment
+
+  Environment:
+    Type: String
+    Default: Production
+
+  Owner:
+    Type: String
+    Default: it.bharathlenin@gmail.com
+
+  DevelopedBy:
+    Type: String
+    Default: Bharath
+  # ----------------------------------------------------------
+  # GitHub CodeConnections
+  #
+  # ARN of the existing AWS CodeConnections connection used
+  # by CodePipeline to securely access the GitHub repository.
+  # ----------------------------------------------------------
+  GitHubConnectionArn:
+    Type: String
+    Default: arn:aws:codeconnections:ap-southeast-1:047612973711:connection/1394240d-4859-42ce-a6b8-8ea34b41d95c
+    Description: ARN of the existing GitHub CodeConnections connection
+    # ----------------------------------------------------------
+  # GitHub repository configuration
+  #
+  # These values identify the repository and branch used by
+  # the CodePipeline source stage.
+  # ----------------------------------------------------------
+  GitHubRepository:
+    Type: String
+    Description: GitHub repository in owner/repository format
+    Default: Bharath77Bharath/Secure-Static-Website-Deployment
+
+  GitHubBranch:
+    Type: String
+    Default: main
+    Description: GitHub branch used as the pipeline source
+
+
+# ------------------------------------------------------------
+# Resources
+# AWS infrastructure managed by CloudFormation.
+# ------------------------------------------------------------
+Resources:
+
+  # ----------------------------------------------------------
+  # KMS - Customer Managed Encryption Key
+  #
+  # This key will eventually be used for:
+  # - S3 encryption
+  # - CodePipeline artifact encryption
+  # - SNS encryption
+  #
+  # IAM policies will later grant the required services
+  # permission to use this key.
+  # ----------------------------------------------------------
+  DeploymentKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+
+      Description: KMS key for Secure Static Website Deployment
+
+      # Enable automatic annual rotation of the key material.
+      EnableKeyRotation: true
+
+      # Allow IAM policies in this AWS account to delegate
+      # permissions to the KMS key.
+      KeyPolicy:
+        Version: '2012-10-17'
+
+        Statement:
+
+          # Account-level permission that keeps the key
+          # administrable and enables IAM-based permissions.
+          - Sid: EnableIAMUserPermissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          # ----------------------------------------------------------
+          # Allow CloudFront OAC to use the KMS key for SSE-KMS objects.
+          #
+          # CloudFront needs these permissions when retrieving objects
+          # from the private S3 origin.
+          # ----------------------------------------------------------
+          - Sid: AllowCloudFrontServicePrincipalSSEKMS
+            Effect: Allow
+
+            Principal:
+              Service: cloudfront.amazonaws.com
+
+            Action:
+              - kms:Decrypt
+              - kms:Encrypt
+              - kms:GenerateDataKey*
+
+            Resource: '*'
+
+            Condition:
+              StringLike:
+                AWS:SourceArn: !Sub arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/*
+
+      # Standard project tags applied to the KMS key.
+      Tags:
+        - Key: Owner
+          Value: !Ref Owner
+
+        - Key: DevelopedBy
+          Value: !Ref DevelopedBy
+
+        - Key: Project
+          Value: !Ref ProjectName
+
+        - Key: Environment
+          Value: !Ref Environment
+  # ----------------------------------------------------------
+  # KMS Alias
+  #
+  # Provides a human-readable name for the KMS key instead
+  # of requiring us to work with the generated key ID.
+  # ----------------------------------------------------------
+  DeploymentKMSAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/${ProjectName}-deployment
+      TargetKeyId: !Ref DeploymentKMSKey
+  # ----------------------------------------------------------
+  # S3 - Private Website Bucket
+  #
+  # Stores the static website files:
+  # - index.html
+  # - style.css
+  # - script.js
+  #
+  # The bucket remains private. CloudFront will later access
+  # the bucket through Origin Access Control (OAC).
+  # ----------------------------------------------------------
+  WebsiteBucket:
+    Type: AWS::S3::Bucket
+
+    Properties:
+
+      # Keep all public access blocked.
+      # CloudFront will be granted access later through
+      # a bucket policy when the CloudFront OAC is created.
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+      # Enable versioning so previous website versions can
+      # be recovered if a deployment overwrites an object.
+      VersioningConfiguration:
+        Status: Enabled
+
+      # Encrypt all newly uploaded objects using our
+      # customer-managed KMS key.
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt DeploymentKMSKey.Arn
+
+            # S3 Bucket Keys reduce the number of requests
+            # made from S3 to AWS KMS.
+            BucketKeyEnabled: true
+
+      # Apply the standard project tags to the bucket.
+      Tags:
+        - Key: Owner
+          Value: !Ref Owner
+
+        - Key: DevelopedBy
+          Value: !Ref DevelopedBy
+
+        - Key: Project
+          Value: !Ref ProjectName
+
+        - Key: Environment
+          Value: !Ref Environment
+
+    # ----------------------------------------------------------
+  # CloudFront - Origin Access Control
+  #
+  # OAC allows CloudFront to securely access the private S3
+  # bucket without making the bucket publicly accessible.
+  # ----------------------------------------------------------
+  WebsiteOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+
+        # Name used to identify this OAC.
+        Name: !Sub ${ProjectName}-OAC
+
+        # CloudFront is accessing an S3 origin.
+        OriginAccessControlOriginType: s3
+
+        # Sign every request sent from CloudFront to S3.
+        SigningBehavior: always
+
+        # Use AWS Signature Version 4 for request signing.
+        SigningProtocol: sigv4
+
+
+  # ----------------------------------------------------------
+  # CloudFront - Distribution
+  #
+  # Provides HTTPS delivery of the static website while keeping
+  # the S3 bucket private.
+  # ----------------------------------------------------------
+  WebsiteCloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+
+        # CloudFront serves index.html when the root URL is
+        # requested.
+        DefaultRootObject: index.html
+
+        # Enable the distribution after creation.
+        Enabled: true
+
+        # Use the CloudFront-managed distribution hostname.
+        Comment: !Sub ${ProjectName} CloudFront Distribution
+
+        # Configure the private S3 bucket as the origin.
+        Origins:
+          - Id: WebsiteS3Origin
+            DomainName: !GetAtt WebsiteBucket.RegionalDomainName
+
+            # Connect CloudFront to S3 using the OAC created above.
+            OriginAccessControlId: !Ref WebsiteOriginAccessControl
+
+            S3OriginConfig: {}
+
+        # Default behavior for requests to the website.
+        DefaultCacheBehavior:
+          TargetOriginId: WebsiteS3Origin
+
+          # Redirect HTTP requests to HTTPS.
+          ViewerProtocolPolicy: redirect-to-https
+
+          # Allow normal website read requests.
+          AllowedMethods:
+            - GET
+            - HEAD
+
+          # Cache GET/HEAD responses at CloudFront edge locations.
+          CachedMethods:
+            - GET
+            - HEAD
+
+          # Use the AWS-managed caching policy for optimized
+          # caching of static content.
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+
+        # CloudFront serves content from all edge locations.
+        PriceClass: PriceClass_All
+
+        # Use the default CloudFront certificate for HTTPS.
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+      # Standard project tags.
+      Tags:
+        - Key: Owner
+          Value: !Ref Owner
+
+        - Key: DevelopedBy
+          Value: !Ref DevelopedBy
+
+        - Key: Project
+          Value: !Ref ProjectName
+
+        - Key: Environment
+          Value: !Ref Environment    
+  # ----------------------------------------------------------
+  # S3 - Bucket Policy
+  #
+  # Allows ONLY our CloudFront distribution to read objects
+  # from the private website bucket.
+  #
+  # Direct public access remains blocked.
+  # ----------------------------------------------------------
+  WebsiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebsiteBucket
+
+      PolicyDocument:
+        Version: '2012-10-17'
+
+        Statement:
+
+          # Allow CloudFront to read website objects.
+          - Sid: AllowCloudFrontRead
+
+            Effect: Allow
+
+            Principal:
+              Service: cloudfront.amazonaws.com
+
+            Action:
+              - s3:GetObject
+
+            Resource: !Sub ${WebsiteBucket.Arn}/*
+
+            # Restrict access to our specific CloudFront
+            # distribution instead of allowing every
+            # CloudFront distribution in the account.
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${WebsiteCloudFrontDistribution}   
+
+  # ----------------------------------------------------------
+  # IAM - CodePipeline Service Role
+  #
+  # This role is assumed by AWS CodePipeline so that the
+  # service can interact with the resources used by the
+  # deployment pipeline.
+  #
+  # Permissions will be kept as narrowly scoped as possible
+  # and expanded only when the corresponding pipeline
+  # resources are introduced.
+  # ----------------------------------------------------------
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+
+      # Allow the CodePipeline service to assume this role.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+
+        Statement:
+          - Sid: CodePipelineAssumeRole
+            Effect: Allow
+
+            Principal:
+              Service: codepipeline.amazonaws.com
+
+            Action:
+              - sts:AssumeRole
+      # --------------------------------------------------------
+      # CodePipeline - Artifact Store Permissions
+      #
+      # Allows CodePipeline to read and write pipeline artifacts
+      # in our dedicated artifact bucket.
+      # --------------------------------------------------------
+      Policies:
+        - PolicyName: CodePipelineArtifactStorePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+
+            Statement:
+
+              # Bucket-level permissions required to inspect
+              # the artifact bucket.
+              - Sid: ArtifactBucketAccess
+                Effect: Allow
+                Action:
+                  - s3:GetBucketVersioning
+                  - s3:GetBucketAcl
+                  - s3:GetBucketLocation
+                Resource: !GetAtt PipelineArtifactBucket.Arn
+
+              # Object-level permissions required to exchange
+              # artifacts between pipeline stages.
+              - Sid: ArtifactObjectAccess
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObjectTagging
+                  - s3:GetObjectTagging
+                  - s3:GetObjectVersionTagging
+                Resource: !Sub ${PipelineArtifactBucket.Arn}/*
+
+              # Allow CodePipeline to use our customer-managed
+              # KMS key for encrypted pipeline artifacts.
+              - Sid: ArtifactKMSAccess
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:Encrypt
+                  - kms:GenerateDataKey
+                  - kms:DescribeKey
+                Resource: !GetAtt DeploymentKMSKey.Arn
+        # ------------------------------------------------------
+        # CodePipeline - CodeBuild permissions
+        #
+        # Allows CodePipeline to start and monitor the CodeBuild
+        # project used by the pipeline.
+        # ------------------------------------------------------
+        - PolicyName: CodePipelineCodeBuildPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+
+            Statement:
+              - Sid: CodeBuildExecution
+                Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                Resource: !GetAtt WebsiteCodeBuildProject.Arn
+                # ------------------------------------------------------
+        # CodePipeline - GitHub CodeConnections permissions
+        #
+        # Allows CodePipeline to use the existing authenticated
+        # GitHub connection.
+        # ------------------------------------------------------
+        - PolicyName: CodePipelineGitHubConnectionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+
+            Statement:
+              - Sid: UseGitHubConnection
+                Effect: Allow
+                Action:
+                  - codeconnections:UseConnection
+                  - codestar-connections:UseConnection
+                Resource: !Ref GitHubConnectionArn
+                # ------------------------------------------------------
+        # CodePipeline - Website S3 deployment permissions
+        #
+        # Allows the S3 deployment stage to publish the
+        # CodeBuild output into the private website bucket.
+        # ------------------------------------------------------
+        - PolicyName: CodePipelineWebsiteDeployPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+
+            Statement:
+
+              # Bucket-level permissions required by the S3
+              # deployment action.
+              - Sid: WebsiteBucketAccess
+                Effect: Allow
+                Action:
+                  - s3:GetBucketVersioning
+                  - s3:GetBucketAcl
+                  - s3:GetBucketLocation
+                Resource: !GetAtt WebsiteBucket.Arn
+
+              # Object-level permissions required to deploy
+              # the frontend files.
+              - Sid: WebsiteObjectAccess
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:PutObjectVersionAcl
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource: !Sub ${WebsiteBucket.Arn}/*
+
+              # The website bucket uses our customer-managed
+              # KMS key for default SSE-KMS encryption.
+              - Sid: WebsiteKMSAccess
+                Effect: Allow
+                Action:
+                  - kms:GenerateDataKey
+                  - kms:Decrypt
+                Resource: !GetAtt DeploymentKMSKey.Arn
+        # Allow CodePipeline Commands action to invalidate
+        # cached CloudFront objects after deployment.
+        - PolicyName: CloudFrontInvalidationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AllowCloudFrontInvalidation
+                Effect: Allow
+                Action:
+                  - cloudfront:CreateInvalidation
+                Resource:
+                  - !Sub arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${WebsiteCloudFrontDistribution}
+      # Standard project tags.
+      Tags:
+        - Key: Owner
+          Value: !Ref Owner
+
+        - Key: DevelopedBy
+          Value: !Ref DevelopedBy
+
+        - Key: Project
+          Value: !Ref ProjectName
+
+        - Key: Environment
+          Value: !Ref Environment
+  # ----------------------------------------------------------
+  # IAM - CodeBuild Service Role
+  #
+  # This role is assumed by AWS CodeBuild when executing the
+  # project build.
+  #
+  # Permissions will be added later based on the actual
+  # CodeBuild project requirements.
+  # ----------------------------------------------------------
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+
+      # Allow the CodeBuild service to assume this role.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+
+        Statement:
+          - Sid: CodeBuildAssumeRole
+            Effect: Allow
+
+            Principal:
+              Service: codebuild.amazonaws.com
+
+            Action:
+              - sts:AssumeRole
+      # --------------------------------------------------------
+      # CodeBuild logging permissions
+      #
+      # These permissions allow CodeBuild to write its build
+      # output to the dedicated CloudWatch Logs log group.
+      # --------------------------------------------------------
+      Policies:
+        - PolicyName: CodeBuildCloudWatchLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+
+            Statement:
+
+              # Allow CodeBuild to create the log stream used
+              # for an individual build.
+              - Sid: CreateLogStream
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                Resource: !Sub >-
+                  arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ProjectName}-Build:*
+
+              # Allow CodeBuild to write build log events.
+              - Sid: WriteLogEvents
+                Effect: Allow
+                Action:
+                  - logs:PutLogEvents
+                Resource: !Sub >-
+                  arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ProjectName}-Build:*
+        # ------------------------------------------------------
+        # CodeBuild - Pipeline Artifact Permissions
+        #
+        # Allows CodeBuild to consume the input artifact supplied
+        # by CodePipeline and return its build artifact.
+        # ------------------------------------------------------
+        - PolicyName: CodeBuildArtifactStorePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+
+            Statement:
+
+              # Verify and inspect the artifact bucket.
+              - Sid: ArtifactBucketAccess
+                Effect: Allow
+                Action:
+                  - s3:GetBucketAcl
+                  - s3:GetBucketLocation
+                Resource: !GetAtt PipelineArtifactBucket.Arn
+
+              # Read input artifacts and write build output.
+              - Sid: ArtifactObjectAccess
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                Resource: !Sub ${PipelineArtifactBucket.Arn}/*
+
+              # Use the customer-managed KMS key protecting
+              # the CodePipeline artifact bucket.
+              - Sid: ArtifactKMSAccess
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:Encrypt
+                  - kms:GenerateDataKey
+                  - kms:DescribeKey
+                Resource: !GetAtt DeploymentKMSKey.Arn
+
+      # Standard project tags.
+      Tags:
+        - Key: Owner
+          Value: !Ref Owner
+
+        - Key: DevelopedBy
+          Value: !Ref DevelopedBy
+
+        - Key: Project
+          Value: !Ref ProjectName
+
+        - Key: Environment
+          Value: !Ref Environment
+  # ----------------------------------------------------------
+  # CodeBuild - Frontend Validation and Build Project
+  #
+  # CodePipeline will provide the source artifact to CodeBuild.
+  # CodeBuild executes buildspec.yml and returns the generated
+  # artifact back to CodePipeline.
+  # ----------------------------------------------------------
+  WebsiteCodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+
+      # Name of the CodeBuild project.
+      Name: !Sub ${ProjectName}-Build
+
+      # IAM role assumed by CodeBuild during the build.
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+
+      # Build environment configuration.
+      Environment:
+
+        # CodeBuild runs the build inside a managed container.
+        Type: LINUX_CONTAINER
+
+        # Smallest standard compute environment is sufficient
+        # for validating and packaging our static frontend.
+        ComputeType: BUILD_GENERAL1_SMALL
+
+        # Ubuntu 24.04 standard CodeBuild image.
+        Image: aws/codebuild/standard:8.0
+
+        # CodeBuild manages the Docker image.
+        ImagePullCredentialsType: CODEBUILD
+
+      # Source is supplied by CodePipeline.
+      Source:
+        Type: CODEPIPELINE
+
+        # Use the buildspec.yml located in the source repository.
+        BuildSpec: buildspec.yml
+
+      # Build output is returned to CodePipeline.
+      Artifacts:
+        Type: CODEPIPELINE
+
+      # Enable CloudWatch Logs for build execution logs.
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+
+      # Standard project tags.
+      Tags:
+        - Key: Owner
+          Value: !Ref Owner
+
+        - Key: DevelopedBy
+          Value: !Ref DevelopedBy
+
+        - Key: Project
+          Value: !Ref ProjectName
+
+        - Key: Environment
+          Value: !Ref Environment
+  # ----------------------------------------------------------
+  # CloudWatch Logs - CodeBuild Log Group
+  #
+  # Stores the logs generated by the CodeBuild project.
+  # The log group is managed by CloudFormation so that its
+  # lifecycle is tied to this infrastructure stack.
+  # ----------------------------------------------------------
+  CodeBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+
+      # CodeBuild uses this standard log-group naming pattern.
+      LogGroupName: !Sub /aws/codebuild/${ProjectName}-Build
+
+      # Retain logs for 30 days to support troubleshooting
+      # without keeping unnecessary historical logs forever.
+      RetentionInDays: 30
+
+      # Standard project tags.
+      Tags:
+        - Key: Owner
+          Value: !Ref Owner
+
+        - Key: DevelopedBy
+          Value: !Ref DevelopedBy
+
+        - Key: Project
+          Value: !Ref ProjectName
+
+        - Key: Environment
+          Value: !Ref Environment
+  # ----------------------------------------------------------
+  # S3 - CodePipeline Artifact Store
+  #
+  # This bucket stores artifacts exchanged between CodePipeline
+  # stages, such as the source package and CodeBuild output.
+  #
+  # This is separate from WebsiteBucket:
+  # - WebsiteBucket       -> production website files
+  # - ArtifactBucket      -> temporary pipeline artifacts
+  # ----------------------------------------------------------
+  PipelineArtifactBucket:
+    Type: AWS::S3::Bucket
+
+    Properties:
+
+      # CodePipeline artifact stores require versioning so that artifact objects can be tracked safely.
+      VersioningConfiguration:
+        Status: Enabled
+
+      # Encrypt pipeline artifacts with our customer-managed
+      # KMS key instead of the default S3-managed key.
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt DeploymentKMSKey.Arn
+
+            # Reduce the number of KMS requests generated by S3.
+            BucketKeyEnabled: true
+
+      # Prevent direct public access to pipeline artifacts.
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+      # Standard project tags.
+      Tags:
+        - Key: Owner
+          Value: !Ref Owner
+
+        - Key: DevelopedBy
+          Value: !Ref DevelopedBy
+
+        - Key: Project
+          Value: !Ref ProjectName
+
+        - Key: Environment
+          Value: !Ref Environment
+  # ----------------------------------------------------------
+  # CodePipeline - Static Website Deployment Pipeline
+  #
+  # Pipeline flow:
+  #
+  # GitHub
+  #   ↓
+  # Source
+  #   ↓
+  # CodeBuild
+  #   ↓
+  # Manual Approval
+  #   ↓
+  # S3 Website Bucket
+  #
+  # CloudFront invalidation will be added to the deployment
+  # flow after the core pipeline is working.
+  # ----------------------------------------------------------
+  WebsitePipeline:
+    Type: AWS::CodePipeline::Pipeline
+
+    Properties:
+
+      # Pipeline name.
+      Name: !Sub ${ProjectName}-Pipeline
+
+      # IAM role used by CodePipeline.
+      RoleArn: !GetAtt CodePipelineRole.Arn
+
+      # Keep the pipeline execution model simple.
+      # A newer commit supersedes an older execution.
+      ExecutionMode: SUPERSEDED
+
+      # Re-run the pipeline when the pipeline definition itself
+      # is updated by CloudFormation.
+      RestartExecutionOnUpdate: false
+
+      # Use the existing encrypted artifact bucket.
+      ArtifactStore:
+        Type: S3
+        Location: !Ref PipelineArtifactBucket
+
+        EncryptionKey:
+          Type: KMS
+          Id: !GetAtt DeploymentKMSKey.Arn
+
+      # ------------------------------------------------------
+      # Pipeline stages
+      # ------------------------------------------------------
+      Stages:
+
+        # ----------------------------------------------------
+        # Stage 1 - GitHub Source
+        # ----------------------------------------------------
+        - Name: Source
+
+          Actions:
+            - Name: GitHubSource
+
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: '1'
+
+              Configuration:
+                ConnectionArn: !Ref GitHubConnectionArn
+                FullRepositoryId: !Ref GitHubRepository
+                BranchName: !Ref GitHubBranch
+
+                # CodeBuild receives a normal ZIP source artifact.
+                OutputArtifactFormat: CODE_ZIP
+
+                # Automatically trigger the pipeline when a
+                # commit is pushed to the configured branch.
+                DetectChanges: 'true'
+
+              OutputArtifacts:
+                - Name: SourceArtifact
+
+              RunOrder: 1
+
+        # ----------------------------------------------------
+        # Stage 2 - CodeBuild
+        # ----------------------------------------------------
+        - Name: Build
+
+          Actions:
+            - Name: BuildFrontend
+
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+
+              Configuration:
+                ProjectName: !Ref WebsiteCodeBuildProject
+
+                # The source artifact contains buildspec.yml.
+                PrimarySource: SourceArtifact
+
+              InputArtifacts:
+                - Name: SourceArtifact
+
+              OutputArtifacts:
+                - Name: BuildArtifact
+
+              RunOrder: 1
+
+        # ----------------------------------------------------
+        # Stage 3 - Manual Approval
+        # ----------------------------------------------------
+        - Name: Approval
+
+          Actions:
+            - Name: ApproveDeployment
+
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: '1'
+
+              Configuration:
+                CustomData: >-
+                  Review the CodeBuild result and approve deployment
+                  of the validated frontend to the production S3 bucket.
+
+              RunOrder: 1
+
+        # ----------------------------------------------------
+        # Stage 4 - S3 Deployment
+        # ----------------------------------------------------
+        - Name: Deploy
+
+          Actions:
+            - Name: DeployWebsite
+
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: S3
+                Version: '1'
+
+              Configuration:
+                BucketName: !Ref WebsiteBucket
+
+                # Extract the CodeBuild ZIP artifact and upload
+                # its files directly into the website bucket.
+                Extract: 'true'
+
+              InputArtifacts:
+                - Name: BuildArtifact
+
+              RunOrder: 1
+
+            # Invalidate CloudFront cache after deployment
+            - Name: CacheInvalidation
+              ActionTypeId:
+                Category: Compute
+                Owner: AWS
+                Provider: Commands
+                Version: '1'
+
+              Commands:
+                - !Sub 'aws cloudfront create-invalidation --distribution-id ${WebsiteCloudFrontDistribution} --paths "/*"'
+
+              RunOrder: 2
+
+      # Standard project tags.
+      Tags:
+        - Key: Owner
+          Value: !Ref Owner
+
+        - Key: DevelopedBy
+          Value: !Ref DevelopedBy
+
+        - Key: Project
+          Value: !Ref ProjectName
+
+        - Key: Environment
+          Value: !Ref Environment
+
+# ------------------------------------------------------------
+# Outputs
+# Useful values exposed by the CloudFormation stack.
+# ------------------------------------------------------------
+Outputs:
+
+  # KMS key ID needed for encrypting additional resources and granting IAM permissions to use the key.
+  KMSKeyId:
+    Description: ID of the customer-managed KMS key
+    Value: !Ref DeploymentKMSKey
+
+  # Human-readable alias for the KMS key used in CLI commands, policies, and resource configurations.
+  KMSAlias:
+    Description: Alias of the customer-managed KMS key
+    Value: !Sub alias/${ProjectName}-deployment
+
+  # Name of the S3 bucket for uploading and storing website files.
+  WebsiteBucketName:
+    Description: Name of the private S3 bucket used to store website files
+    Value: !Ref WebsiteBucket
+
+  # ARN of the S3 bucket used in bucket policies and IAM permissions.
+  WebsiteBucketArn:
+    Description: ARN of the private S3 website bucket
+    Value: !GetAtt WebsiteBucket.Arn
+  
+  # CloudFront distribution ID used later for cache invalidation.
+  CloudFrontDistributionId:
+    Description: CloudFront distribution ID
+    Value: !Ref WebsiteCloudFrontDistribution
+
+  # Public CloudFront hostname (e.g., d12345.cloudfront.net) used to access the website via HTTPS.
+  CloudFrontDomainName:
+    Description: CloudFront distribution domain name
+    Value: !GetAtt WebsiteCloudFrontDistribution.DomainName
+
+  CodePipelineRoleArn:
+    Description: ARN of the IAM role used by CodePipeline
+    Value: !GetAtt CodePipelineRole.Arn
+
+  CodeBuildRoleArn:
+    Description: ARN of the IAM role used by CodeBuild
+    Value: !GetAtt CodeBuildRole.Arn
+
+  CodeBuildProjectName:
+    Description: Name of the CodeBuild project
+    Value: !Ref WebsiteCodeBuildProject
+  
+  # Name of the S3 bucket used by CodePipeline for artifacts.
+  PipelineArtifactBucketName:
+    Description: S3 bucket used for CodePipeline artifacts
+    Value: !Ref PipelineArtifactBucket
+
+  # ARN used later when creating least-privilege IAM policies.
+  PipelineArtifactBucketArn:
+    Description: ARN of the CodePipeline artifact bucket
+    Value: !GetAtt PipelineArtifactBucket.Arn
+
+  WebsitePipelineName:
+    Description: Name of the CodePipeline deployment pipeline
+    Value: !Ref WebsitePipeline

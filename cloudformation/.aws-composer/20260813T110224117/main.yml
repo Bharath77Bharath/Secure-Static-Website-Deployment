@@ -1,0 +1,43 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: Secure Static Website Deployment
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: SecureStaticWebsiteDeployment
+
+  Environment:
+    Type: String
+    Default: Production
+
+  Owner:
+    Type: String
+    Default: it.bharathlenin@gmail.com
+
+  DevelopedBy:
+    Type: String
+    Default: Bharath
+
+Resources:
+
+  DeploymentKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for Secure Static Website Deployment
+      EnableKeyRotation: true
+      Tags:
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: DevelopedBy
+          Value: !Ref DevelopedBy
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+
+  KMSKeyId:
+    Description: ID of the customer-managed KMS key
+    Value: !Ref DeploymentKMSKey
