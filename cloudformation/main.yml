@@ -490,6 +490,41 @@ Resources:
                   - cloudfront:CreateInvalidation
                 Resource:
                   - !Sub arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${WebsiteCloudFrontDistribution}
+        # ------------------------------------------------------
+        # CodePipeline - Commands CloudWatch Logs Permissions
+        #
+        # The Commands action runs on managed compute and writes
+        # its execution output to the default CodePipeline
+        # CloudWatch Logs log group.
+        # ------------------------------------------------------
+        - PolicyName: CodePipelineCommandsLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+
+            Statement:
+
+              # Allow the Commands action to create its
+              # CodePipeline log group when required.
+              - Sid: CreateCodePipelineLogGroup
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codepipeline/${ProjectName}-Pipeline
+
+              # Allow the Commands action to create log streams
+              # inside the CodePipeline log group.
+              - Sid: CreateCodePipelineLogStream
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codepipeline/${ProjectName}-Pipeline:*
+
+              # Allow the Commands action to write execution logs.
+              - Sid: WriteCodePipelineLogEvents
+                Effect: Allow
+                Action:
+                  - logs:PutLogEvents
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codepipeline/${ProjectName}-Pipeline:*
       # Standard project tags.
       Tags:
         - Key: Owner
