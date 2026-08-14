@@ -1169,11 +1169,12 @@ Resources:
 
         - Key: Environment
           Value: !Ref Environment
-  # ----------------------------------------------------------
-  # EventBridge - Manual Approval Status Rule
+    # ----------------------------------------------------------
+  # EventBridge - Manual Approval Notification Rule
   #
-  # Captures CodePipeline manual approval events and sends
-  # APPROVED / DENIED events to the notification Lambda.
+  # IN_PROGRESS -> Deployment Approval Required email
+  # SUCCEEDED   -> Deployment Approved email
+  # FAILED      -> Deployment Denied email
   # ----------------------------------------------------------
   DeploymentApprovalEventRule:
     Type: AWS::Events::Rule
@@ -1194,7 +1195,7 @@ Resources:
 
         detail:
           pipeline:
-            - !Ref WebsitePipeline
+            - !Sub "${ProjectName}-Pipeline"
 
           stage:
             - Approval
@@ -1203,6 +1204,7 @@ Resources:
             - ApproveDeployment
 
           state:
+            - IN_PROGRESS
             - SUCCEEDED
             - FAILED
 
@@ -1210,11 +1212,11 @@ Resources:
         - Id: DeploymentNotificationLambdaTarget
           Arn: !GetAtt DeploymentNotificationLambda.Arn
 
+
   # ----------------------------------------------------------
-  # Lambda Permission - EventBridge
+  # Lambda Permission - Manual Approval EventBridge Rule
   #
-  # Allows the manual approval EventBridge rule to invoke
-  # the deployment notification Lambda.
+  # Allows EventBridge to invoke the notification Lambda.
   # ----------------------------------------------------------
   DeploymentApprovalEventLambdaPermission:
     Type: AWS::Lambda::Permission
@@ -1227,6 +1229,67 @@ Resources:
       Principal: events.amazonaws.com
 
       SourceArn: !GetAtt DeploymentApprovalEventRule.Arn
+
+
+  # ----------------------------------------------------------
+  # EventBridge - CloudFront Cache Invalidation Success Rule
+  #
+  # Sends the final deployment-success notification only
+  # after the CloudFront cache invalidation action succeeds.
+  # ----------------------------------------------------------
+  DeploymentCacheInvalidationSuccessRule:
+    Type: AWS::Events::Rule
+
+    Properties:
+      Name: !Sub ${ProjectName}-DeploymentSuccess
+
+      Description: Sends deployment success notification after CloudFront cache invalidation
+
+      State: ENABLED
+
+      EventPattern:
+        source:
+          - aws.codepipeline
+
+        detail-type:
+          - CodePipeline Action Execution State Change
+
+        detail:
+          pipeline:
+            - !Sub "${ProjectName}-Pipeline"
+
+          stage:
+            - Deploy
+
+          action:
+            - CacheInvalidation
+
+          state:
+            - SUCCEEDED
+
+      Targets:
+        - Id: DeploymentNotificationLambdaSuccessTarget
+          Arn: !GetAtt DeploymentNotificationLambda.Arn
+
+
+  # ----------------------------------------------------------
+  # Lambda Permission - Cache Invalidation EventBridge Rule
+  #
+  # Allows EventBridge to invoke the notification Lambda
+  # after CloudFront cache invalidation succeeds.
+  # ----------------------------------------------------------
+  DeploymentCacheInvalidationLambdaPermission:
+    Type: AWS::Lambda::Permission
+
+    Properties:
+      FunctionName: !Ref DeploymentNotificationLambda
+
+      Action: lambda:InvokeFunction
+
+      Principal: events.amazonaws.com
+
+      SourceArn: !GetAtt DeploymentCacheInvalidationSuccessRule.Arn
+      
   # ----------------------------------------------------------
   # Lambda - Deployment Notification Handler
   #
@@ -1262,30 +1325,49 @@ Resources:
           from datetime import datetime, timezone
 
 
+          # --------------------------------------------------
           # AWS clients
+          # --------------------------------------------------
+
           sns = boto3.client("sns")
           codepipeline = boto3.client("codepipeline")
 
 
-          # Environment variables configured by CloudFormation
+          # --------------------------------------------------
+          # Environment variables
+          # --------------------------------------------------
+
           SNS_TOPIC_ARN = os.environ["SNS_TOPIC_ARN"]
           PIPELINE_NAME = os.environ["PIPELINE_NAME"]
+          PIPELINE_URL = os.environ["PIPELINE_URL"]
           CLOUDFRONT_URL = os.environ["CLOUDFRONT_URL"]
 
+
+          # --------------------------------------------------
+          # Lambda handler
+          # --------------------------------------------------
 
           def lambda_handler(event, context):
 
               # --------------------------------------------------
-              # Log the complete EventBridge event.
+              # Log complete EventBridge event
               # --------------------------------------------------
+
               print("Received EventBridge event:")
               print(json.dumps(event, indent=2))
 
+
+              # --------------------------------------------------
+              # Extract EventBridge detail
+              # --------------------------------------------------
+
               detail = event.get("detail", {})
+
 
               # --------------------------------------------------
               # Common CodePipeline information
               # --------------------------------------------------
+
               pipeline_name = detail.get(
                   "pipeline",
                   PIPELINE_NAME
@@ -1294,21 +1376,6 @@ Resources:
               execution_id = detail.get(
                   "execution-id",
                   "N/A"
-              )
-
-              region = event.get(
-                  "region",
-                  os.environ.get("AWS_REGION", "N/A")
-              )
-
-              event_time = event.get(
-                  "time",
-                  datetime.now(timezone.utc).isoformat()
-              )
-
-              state = detail.get(
-                  "state",
-                  "UNKNOWN"
               )
 
               stage = detail.get(
@@ -1321,27 +1388,51 @@ Resources:
                   "N/A"
               )
 
+              state = detail.get(
+                  "state",
+                  "UNKNOWN"
+              )
+
+              region = event.get(
+                  "region",
+                  os.environ.get("AWS_REGION", "N/A")
+              )
+
+              event_time = event.get(
+                  "time",
+                  datetime.now(timezone.utc).isoformat()
+              )
+
+
               # --------------------------------------------------
-              # Determine whether this is the Manual Approval
-              # action.
-              #
-              # CodePipeline reports:
-              #
-              # Approval + SUCCEEDED = Approved
-              # Approval + FAILED    = Rejected
+              # Identify Manual Approval action
               # --------------------------------------------------
-              is_approval_event = (
+
+              is_manual_approval = (
                   stage == "Approval"
                   and action == "ApproveDeployment"
               )
 
+
               # --------------------------------------------------
-              # Retrieve approval actor/comment information.
+              # Identify Cache Invalidation action
               # --------------------------------------------------
+
+              is_cache_invalidation = (
+                  stage == "Deploy"
+                  and action == "CacheInvalidation"
+              )
+
+
+              # --------------------------------------------------
+              # Approval information
+              # --------------------------------------------------
+
               approved_by = "N/A"
               approval_comment = "N/A"
 
-              if is_approval_event and execution_id != "N/A":
+
+              if is_manual_approval:
 
                   try:
 
@@ -1352,20 +1443,25 @@ Resources:
                           }
                       )
 
+
                       for action_execution in response.get(
                           "actionExecutionDetails",
                           []
                       ):
 
                           if (
-                              action_execution.get("stageName") == stage
-                              and action_execution.get("actionName") == action
+                              action_execution.get("stageName")
+                              == stage
+                              and
+                              action_execution.get("actionName")
+                              == action
                           ):
 
                               approved_by = action_execution.get(
                                   "updatedBy",
                                   "N/A"
                               )
+
 
                               execution_result = action_execution.get(
                                   "output",
@@ -1375,12 +1471,15 @@ Resources:
                                   {}
                               )
 
+
                               approval_comment = execution_result.get(
                                   "externalExecutionSummary",
                                   "N/A"
                               )
 
+
                               break
+
 
                   except Exception as error:
 
@@ -1389,12 +1488,64 @@ Resources:
                           str(error)
                       )
 
-              # --------------------------------------------------
-              # APPROVED
+
+              # ==================================================
+              # 1. MANUAL APPROVAL REQUEST
               #
-              # Approval stage + SUCCEEDED
-              # --------------------------------------------------
-              if is_approval_event and state == "SUCCEEDED":
+              # Approval action enters IN_PROGRESS.
+              #
+              # Send email asking reviewer to approve or deny.
+              # ==================================================
+
+              if is_manual_approval and state == "IN_PROGRESS":
+
+                  subject = "Deployment Approval Required"
+
+                  message = f"""Deployment Approval Required
+
+          Secure Static Website Deployment
+
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+          Pipeline:
+          {pipeline_name}
+
+          Stage:
+          {stage}
+
+          Action:
+          {action}
+
+          Region:
+          {region}
+
+          Status:
+          WAITING FOR APPROVAL
+
+          The production deployment is waiting for manual approval.
+
+          Please review the pipeline and either APPROVE or DENY the deployment.
+
+          Pipeline:
+          {PIPELINE_URL}
+
+          Execution ID:
+          {execution_id}
+
+          Event Time:
+          {event_time}
+          """
+
+
+              # ==================================================
+              # 2. DEPLOYMENT APPROVED
+              #
+              # Approval action becomes SUCCEEDED.
+              #
+              # This means the reviewer approved the deployment.
+              # ==================================================
+
+              elif is_manual_approval and state == "SUCCEEDED":
 
                   subject = "Deployment Approved"
 
@@ -1436,16 +1587,20 @@ Resources:
           {event_time}
           """
 
-              # --------------------------------------------------
-              # REJECTED
+
+              # ==================================================
+              # 2B. DEPLOYMENT DENIED
               #
-              # Approval stage + FAILED
-              # --------------------------------------------------
-              elif is_approval_event and state == "FAILED":
+              # Approval action becomes FAILED.
+              #
+              # This means the reviewer rejected the deployment.
+              # ==================================================
 
-                  subject = "Deployment Rejected"
+              elif is_manual_approval and state == "FAILED":
 
-                  message = f"""Deployment Rejected
+                  subject = "Deployment Denied"
+
+                  message = f"""Deployment Denied
 
           Secure Static Website Deployment
 
@@ -1466,7 +1621,7 @@ Resources:
           Status:
           DENIED
 
-          The production deployment approval was rejected.
+          The production deployment approval was denied.
 
           The pipeline will not continue with deployment.
 
@@ -1483,13 +1638,14 @@ Resources:
           {event_time}
           """
 
-              # --------------------------------------------------
-              # SUCCESSFUL DEPLOYMENT
+
+              # ==================================================
+              # 3. DEPLOYMENT SUCCESSFUL
               #
-              # Only treat the Deploy stage as a successful
-              # deployment notification.
-              # --------------------------------------------------
-              elif stage == "Deploy" and state == "SUCCEEDED":
+              # ONLY send this after CacheInvalidation succeeds.
+              # ==================================================
+
+              elif is_cache_invalidation and state == "SUCCEEDED":
 
                   subject = "Deployment Successful"
 
@@ -1502,6 +1658,12 @@ Resources:
           Pipeline:
           {pipeline_name}
 
+          Stage:
+          {stage}
+
+          Action:
+          {action}
+
           Region:
           {region}
 
@@ -1510,8 +1672,11 @@ Resources:
 
           The production deployment completed successfully.
 
+          The website has been deployed to Amazon S3 and the
+          CloudFront cache has been successfully invalidated.
+
           Website:
-          https://{CLOUDFRONT_URL}
+          {CLOUDFRONT_URL}
 
           Execution ID:
           {execution_id}
@@ -1520,14 +1685,21 @@ Resources:
           {event_time}
           """
 
-              # --------------------------------------------------
-              # Ignore unsupported events.
-              # --------------------------------------------------
+
+              # ==================================================
+              # Ignore all other CodePipeline events.
+              # ==================================================
+
               else:
 
                   print(
-                      f"Ignoring unsupported event: "
-                      f"stage={stage}, action={action}, state={state}"
+                      "Ignoring unsupported event:"
+                  )
+
+                  print(
+                      f"Stage={stage}, "
+                      f"Action={action}, "
+                      f"State={state}"
                   )
 
                   return {
@@ -1537,19 +1709,23 @@ Resources:
                       )
                   }
 
-              # --------------------------------------------------
-              # Publish notification through SNS.
-              # --------------------------------------------------
+
+              # ==================================================
+              # Publish notification through SNS
+              # ==================================================
+
               response = sns.publish(
                   TopicArn=SNS_TOPIC_ARN,
                   Subject=subject,
                   Message=message
               )
 
+
               print(
                   "SNS notification published:",
                   response.get("MessageId")
               )
+
 
               return {
                   "statusCode": 200,
@@ -1558,17 +1734,26 @@ Resources:
                   )
               }
 
+
       Environment:
-        Variables:
+          Variables:
 
-          # SNS topic receiving deployment notifications.
-          SNS_TOPIC_ARN: !Ref DeploymentNotificationTopic
+            # SNS topic receiving deployment notifications.
+            SNS_TOPIC_ARN: !Ref DeploymentNotificationTopic
 
-          # CodePipeline being monitored.
-          PIPELINE_NAME: !Ref WebsitePipeline
+            # CodePipeline monitored by the notification Lambda.
+            PIPELINE_NAME: !Ref WebsitePipeline
 
-          # CloudFront URL used by the final success notification.
-          CLOUDFRONT_URL: !GetAtt WebsiteCloudFrontDistribution.DomainName
+            # Direct URL to the CodePipeline page.
+            # Included in the initial approval-request email.
+            PIPELINE_URL: !Sub
+              - https://${AWS::Region}.console.aws.amazon.com/codesuite/codepipeline/pipelines/${PipelineName}/view?region=${AWS::Region}
+              - PipelineName: !Ref WebsitePipeline
+
+            # CloudFront URL included in the final deployment-success email.
+            CLOUDFRONT_URL: !Sub
+              - https://${DistributionDomainName}
+              - DistributionDomainName: !GetAtt WebsiteCloudFrontDistribution.DomainName
         
 # ------------------------------------------------------------
 # Outputs
