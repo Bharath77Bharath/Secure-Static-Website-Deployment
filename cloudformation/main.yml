@@ -1795,6 +1795,7 @@ Outputs:
     Description: CloudFront distribution domain name
     Value: !GetAtt WebsiteCloudFrontDistribution.DomainName
 
+  
   CodePipelineRoleArn:
     Description: ARN of the IAM role used by CodePipeline
     Value: !GetAtt CodePipelineRole.Arn
@@ -1816,6 +1817,7 @@ Outputs:
   PipelineArtifactBucketArn:
     Description: ARN of the CodePipeline artifact bucket
     Value: !GetAtt PipelineArtifactBucket.Arn
+
 
   WebsitePipelineName:
     Description: Name of the CodePipeline deployment pipeline

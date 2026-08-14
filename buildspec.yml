@@ -20,7 +20,7 @@ phases:
 
   post_build:
     commands:
-      - echo "Validation successful. Proceeding to deployment..."
+      - echo "Validation successful.Proceeding to deployment..."
   
 artifacts:
   base-directory: Frontend
