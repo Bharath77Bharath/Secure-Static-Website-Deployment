@@ -1169,12 +1169,12 @@ Resources:
 
         - Key: Environment
           Value: !Ref Environment
-    # ----------------------------------------------------------
+  # ----------------------------------------------------------
   # EventBridge - Manual Approval Notification Rule
   #
-  # IN_PROGRESS -> Deployment Approval Required email
-  # SUCCEEDED   -> Deployment Approved email
-  # FAILED      -> Deployment Denied email
+  # STARTED    -> Deployment Approval Required email
+  # SUCCEEDED  -> Deployment Approved email
+  # FAILED     -> Deployment Denied email
   # ----------------------------------------------------------
   DeploymentApprovalEventRule:
     Type: AWS::Events::Rule
@@ -1204,7 +1204,7 @@ Resources:
             - ApproveDeployment
 
           state:
-            - IN_PROGRESS
+            - STARTED
             - SUCCEEDED
             - FAILED
 
@@ -1289,7 +1289,7 @@ Resources:
       Principal: events.amazonaws.com
 
       SourceArn: !GetAtt DeploymentCacheInvalidationSuccessRule.Arn
-      
+
   # ----------------------------------------------------------
   # Lambda - Deployment Notification Handler
   #
@@ -1497,7 +1497,7 @@ Resources:
               # Send email asking reviewer to approve or deny.
               # ==================================================
 
-              if is_manual_approval and state == "IN_PROGRESS":
+              if is_manual_approval and state == "STARTED":
 
                   subject = "Deployment Approval Required"
 
