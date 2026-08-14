@@ -835,10 +835,12 @@ Resources:
   #   ↓
   # Manual Approval
   #   ↓
-  # S3 Website Bucket
+  # S3 Deployment
+  #   ↓
+  # CloudFront Cache Invalidation
   #
-  # CloudFront invalidation will be added to the deployment
-  # flow after the core pipeline is working.
+  # Deployment notifications are handled separately through
+  # EventBridge → Lambda → SNS → Email.
   # ----------------------------------------------------------
   WebsitePipeline:
     Type: AWS::CodePipeline::Pipeline
@@ -1492,9 +1494,11 @@ Resources:
               # ==================================================
               # 1. MANUAL APPROVAL REQUEST
               #
-              # Approval action enters IN_PROGRESS.
+              # CodePipeline reports the start of the manual
+              # approval action as STARTED.
               #
-              # Send email asking reviewer to approve or deny.
+              # Send an email asking the reviewer to approve
+              # or deny the deployment.
               # ==================================================
 
               if is_manual_approval and state == "STARTED":
